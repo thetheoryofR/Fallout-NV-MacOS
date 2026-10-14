@@ -5,8 +5,12 @@ Apple Silicon (arm64), runs it on a native host (Win32/COM shims, Direct3D 9 →
 instructions in an emulator from the same randomised state and comparing every register, flag and
 byte of memory.
 
-**This repository contains no game code, no game data and nothing derived from any game.** You
-supply an executable you own; everything the tools produce from it stays on your machine.
+> **This project is for educational and research purposes only.**
+>
+> **This repository does not contain any game code, game assets or anything derived from a game.
+> You must provide your own legally purchased copy of Fallout: New Vegas (or any other game) to
+> use it.** Nothing here works without one, and everything the tools produce from it stays on your
+> machine. Piracy is not supported; please do not ask for or share game files.
 
 ## Status
 
@@ -22,7 +26,8 @@ Unicorn interpreter is only a safety net for code the analysis missed.)
 - Not done yet: audio (DirectSound is silent), Bink video, gamepad, the fixed-function pipeline,
   NVSE / script-extender mods.
 
-You need your own DRM-free copy of the game (see below). Nothing in this repository works without it.
+You need your own legally purchased, DRM-free copy of the game (see below). Nothing in this
+repository works without it.
 
 Milestone 0 (lifter proof) on leaf functions: 8,767 of 8,830 testable functions match the original
 exactly (99.3%), 0 crashes. Design notes: [`docs/DESIGN.md`](docs/DESIGN.md).
@@ -86,6 +91,16 @@ python3 recomp/difftest.py "$GAME" "$WORK/build/librecomp.dylib" "$WORK/leaf.jso
 N64Recomp, XenonRecomp and ReXGlue (PowerPC) established the bring-your-own-game static
 recompilation model this project follows for x86.
 
+## Legal
+
+This is an unofficial, non-commercial project made for education and research into static
+recompilation. It is not affiliated with, endorsed by or sponsored by Bethesda Softworks,
+ZeniMax Media, Microsoft or Obsidian Entertainment. Fallout and Fallout: New Vegas are trademarks
+of their respective owners, used here only to describe compatibility.
+
+No game code, assets or generated output are or will be distributed through this repository or
+its releases. Buy the game to use this project.
+
 ## Licence
 
-MIT — see [`LICENSE`](LICENSE). Covers this repository's code only.
+MIT — see [`LICENSE`](LICENSE). Covers this repository's code only, not any game.
