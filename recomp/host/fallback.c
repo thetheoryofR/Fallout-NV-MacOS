@@ -32,7 +32,7 @@ static void cpu_to_uc(CPU *c, uc_engine *uc) {
     uc_reg_write(uc, UC_X86_REG_EFLAGS, &efl);
     uint32_t top = c->r[REG_TOP] & 7;
     for (int i = 0; i < 8; i++) {
-        uint8_t f[16] = {0}; memcpy(f, c->r + O_ST0 + 16 * i, 10);     // raw 80-bit: mantissa, exponent
+        uint8_t f[16] = {0}; double d; memcpy(&d, c->r + O_ST0 + 16 * i, 8); f80_put(f, d);   // double -> 80-bit
         uc_reg_write(uc, UC_X86_REG_FP0 + (int)((top + (uint32_t)i) & 7), f);
     }
     uint32_t sw = (top << 11) | ((uint32_t)(c->r[O_C0] & 1) << 8) | ((uint32_t)(c->r[O_C0 + 1] & 1) << 9) |
@@ -52,7 +52,7 @@ static void uc_to_cpu(uc_engine *uc, CPU *c) {
     c->r[O_C0] = (sw >> 8) & 1; c->r[O_C0 + 1] = (sw >> 9) & 1; c->r[O_C0 + 2] = (sw >> 10) & 1; c->r[O_C0 + 3] = (sw >> 14) & 1;
     for (int i = 0; i < 8; i++) {
         uint8_t f[16] = {0}; uc_reg_read(uc, UC_X86_REG_FP0 + (int)((top + (uint32_t)i) & 7), f);
-        memcpy(c->r + O_ST0 + 16 * i, f, 10);
+        double d = f80_get(f); memcpy(c->r + O_ST0 + 16 * i, &d, 8);
     }
     for (int i = 0; i < 8; i++) { uint64_t x[2]; uc_reg_read(uc, UC_X86_REG_XMM0 + i, x); memcpy(c->r + O_XMM0 + 64 * i, x, 16); }
 }

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "input.h"
 
 static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
@@ -140,6 +141,20 @@ static void load_script(void) {
 }
 void input_script_tick(uint64_t frame) {
     load_script();
+    // FNV_QUIT_AFTER=<seconds>: clean exit (atexit handlers run, so a recording is finalized)
+    static double quit_after = -1; static struct timespec t0;
+    if (quit_after < 0) { const char *q = getenv("FNV_QUIT_AFTER"); quit_after = q ? atof(q) : 0; clock_gettime(CLOCK_MONOTONIC, &t0); }
+    {   // heap accounting every 30 s of wall time
+        extern void gheap_report(void) __attribute__((weak));
+        static struct timespec last;
+        struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+        if (t.tv_sec - last.tv_sec >= 30) { last = t; if (gheap_report) gheap_report(); }
+    }
+    if (quit_after > 0) {
+        struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+        double el = (double)(t.tv_sec - t0.tv_sec) + (double)(t.tv_nsec - t0.tv_nsec) * 1e-9;
+        if (el >= quit_after) { fprintf(stderr, "[input] FNV_QUIT_AFTER: %.0f s elapsed at frame %llu, exiting\n", el, (unsigned long long)frame); exit(0); }
+    }
     while (cursor < nsteps && (int64_t)steps[cursor].frame + shift <= (int64_t)frame) {
         Step *s = &steps[cursor];
         if (!strcmp(s->cmd, "waitdraws")) {

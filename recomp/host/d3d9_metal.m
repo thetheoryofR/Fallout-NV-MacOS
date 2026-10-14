@@ -3,8 +3,9 @@
 // Model: every draw reads the guest-side D3D state (D3DState) and guest resources directly.
 //  - textures/surfaces: one MTLTexture per guest surface/texture object, created on first use;
 //    CPU-written levels are re-uploaded when marked dirty (Unlock / DDS load / UpdateSurface).
-//  - vertex/index data: copied per draw into a per-frame ring buffer (always coherent with what the
-//    game wrote, no lock/discard bookkeeping).
+//  - vertex/index data: static buffers get their own MTLBuffer, re-created (not overwritten, so
+//    in-flight frames keep the old contents) when the game unlocks them. D3DUSAGE_DYNAMIC buffers,
+//    and static ones the game keeps rewriting, are copied per draw into a per-frame ring buffer.
 //  - shaders: translated on first use by sm2msl; pipelines keyed by (vs, ps, vertex layout, render
 //    target formats, blend state, sample count).
 #import <AppKit/AppKit.h>
@@ -12,6 +13,8 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreVideo/CoreVideo.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,7 +29,7 @@
 enum { K_TEX = 1, K_CUBE, K_VOL, K_SURF, K_VB, K_IB, K_DECL, K_VS, K_PS };
 enum { S_W, S_H, S_FMT, S_USAGE, S_POOL, S_DATA, S_PITCH, S_CONT, S_MS, S_LEVEL, S_DIRTY, S_HOST };
 enum { T_W, T_H, T_LEVELS, T_FMT, T_USAGE, T_POOL, T_SURFS, T_FACES, T_LOD, T_DIRTY, T_HOST };
-enum { B_LEN, B_USAGE, B_FMT, B_POOL, B_DATA };
+enum { B_LEN, B_USAGE, B_FMT, B_POOL, B_DATA, B_HOST, B_DIRTY, B_UPS };
 #define FCC(a, b, c_, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c_) << 16) | ((uint32_t)(d) << 24))
 
 // ---- host-side state ------------------------------------------------------------------------------
@@ -41,21 +44,63 @@ static dispatch_semaphore_t inflight;
 #define RING_SIZE (192u << 20)
 static id<MTLBuffer> ring[3];
 static uint32_t ring_idx, ring_off;
+// ---- encoder state cache: skip Metal calls that would set what is already set in this encoder ----
+static struct {
+    __unsafe_unretained id pso, dss;
+    int fixed_valid; uint32_t sref, cull, fill; float bias, slope; MTLViewport vp; MTLScissorRect sc; uint32_t bc;
+    __unsafe_unretained id vbuf[32], fbuf[4]; NSUInteger voff[32], foff[4];
+    int vb_valid[32], fb_valid[32];                 // set*Bytes slots: content below is current
+    uint8_t vbytes[32][256], fbytes[4][256];
+    __unsafe_unretained id ftex[16], fsamp[32], vtex[4], vsamp[4];
+} ec;
+static void ec_reset(void) { memset(&ec, 0, sizeof ec); }
+static void ec_vbuf(id<MTLBuffer> b, NSUInteger off, int i) {
+    if (ec.vbuf[i] == b) { if (ec.voff[i] != off) { [enc setVertexBufferOffset:off atIndex:i]; ec.voff[i] = off; } return; }
+    [enc setVertexBuffer:b offset:off atIndex:i]; ec.vbuf[i] = b; ec.voff[i] = off; ec.vb_valid[i] = 0;
+}
+static void ec_fbuf(id<MTLBuffer> b, NSUInteger off, int i) {
+    if (ec.fbuf[i] == b) { if (ec.foff[i] != off) { [enc setFragmentBufferOffset:off atIndex:i]; ec.foff[i] = off; } return; }
+    [enc setFragmentBuffer:b offset:off atIndex:i]; ec.fbuf[i] = b; ec.foff[i] = off; ec.fb_valid[i] = 0;
+}
+static void ec_vbytes(const void *p, NSUInteger n, int i) {        // n <= 256
+    if (ec.vb_valid[i] && !memcmp(ec.vbytes[i], p, n)) return;
+    [enc setVertexBytes:p length:n atIndex:i]; memcpy(ec.vbytes[i], p, n); ec.vb_valid[i] = 1; ec.vbuf[i] = nil;
+}
+static void ec_fbytes(const void *p, NSUInteger n, int i) {        // i < 4, n <= 256
+    if (ec.fb_valid[i] && !memcmp(ec.fbytes[i], p, n)) return;
+    [enc setFragmentBytes:p length:n atIndex:i]; memcpy(ec.fbytes[i], p, n); ec.fb_valid[i] = 1; ec.fbuf[i] = nil;
+}
 // host objects live in a plain array; the guest object stores index+1 in its *_HOST field
-static NSMutableArray *hostobjs;
-static NSMutableArray<NSNumber *> *free_slots;
+// host objects: a plain table of +1-retained pointers; the guest object stores index+1 in its *_HOST
+// field. Lookups return unretained pointers (no ARC traffic on the per-draw path).
+static void **hostp; static uint32_t hostn, hostcap, *host_free, host_nfree, host_freecap;
 static uint32_t host_field(uint32_t o) {
     uint32_t k = OBJ_KIND(o);
     if (k == K_TEX || k == K_CUBE) return OBJ_F(o, T_HOST);
     if (k == K_SURF) return OBJ_F(o, S_HOST);
+    if (k == K_VB || k == K_IB) return OBJ_F(o, B_HOST);
     return OBJ_F(o, 2);                                       // shaders: code, ntok, host
 }
-static id host_get(uint32_t o) { uint32_t i = G32(host_field(o)); return i ? hostobjs[i - 1] : nil; }
+static inline void *host_get(uint32_t o) { uint32_t i = G32(host_field(o)); return i ? hostp[i - 1] : NULL; }
 static void host_set(uint32_t o, id v) {
-    uint32_t i;
-    if (free_slots.count) { i = free_slots.lastObject.unsignedIntValue; [free_slots removeLastObject]; hostobjs[i] = v; }
-    else { [hostobjs addObject:v]; i = (uint32_t)hostobjs.count - 1; }
+    uint32_t i = G32(host_field(o));
+    if (i) { if (hostp[i - 1]) CFRelease(hostp[i - 1]); hostp[i - 1] = (void *)CFBridgingRetain(v); return; }   // replace
+    if (host_nfree) i = host_free[--host_nfree];
+    else {
+        if (hostn == hostcap) { hostcap = hostcap ? hostcap * 2 : 4096; hostp = realloc(hostp, sizeof *hostp * hostcap); }
+        i = hostn++;
+    }
+    hostp[i] = (void *)CFBridgingRetain(v);
     P32(host_field(o), i + 1);
+}
+static void host_drop(uint32_t o) {
+    uint32_t i = G32(host_field(o));
+    if (!i) return;
+    if (hostp[i - 1]) CFRelease(hostp[i - 1]);
+    hostp[i - 1] = NULL;
+    if (host_nfree == host_freecap) { host_freecap = host_freecap ? host_freecap * 2 : 4096; host_free = realloc(host_free, sizeof *host_free * host_freecap); }
+    host_free[host_nfree++] = i - 1;
+    P32(host_field(o), 0);
 }
 
 static uint64_t ff_skipped, draws_done;
@@ -138,19 +183,22 @@ static HTex *make_tex(uint32_t fmt, uint32_t w, uint32_t h, uint32_t levels, uin
 
 static void upload_level(HTex *t, uint32_t surf, uint32_t face, uint32_t level) {
     if (t.tex.storageMode == MTLStorageModePrivate) return;           // GPU-written targets are not uploaded
-    uint32_t w = G32(OBJ_F(surf, S_W)), h = G32(OBJ_F(surf, S_H)), pitch = G32(OBJ_F(surf, S_PITCH)), data = G32(OBJ_F(surf, S_DATA));
+    uint32_t w = G32(OBJ_F(surf, S_W)), h = G32(OBJ_F(surf, S_H)), pitch = G32(OBJ_F(surf, S_PITCH));
     int blk = d3d_fmt_block(t.fmt);
     uint32_t rows = blk ? (h + 3) / 4 : h;
-    [t.tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:face withBytes:MEM + data
-             bytesPerRow:pitch bytesPerImage:pitch * rows];
+    const uint8_t *bytes = d3d_surf_begin(surf);
+    if (bytes) [t.tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:level slice:face withBytes:bytes
+                       bytesPerRow:pitch bytesPerImage:pitch * rows];
+    d3d_surf_end();
 }
 
 // the host texture for a guest texture / surface object (created on first use, uploads pending dirt)
+static HTex *host_tex(uint32_t o) __attribute__((ns_returns_not_retained));
 static HTex *host_tex(uint32_t o) {
     if (!o) return nil;
     uint32_t kind = OBJ_KIND(o);
     if (kind == K_SURF && G32(OBJ_F(o, S_CONT))) return host_tex(G32(OBJ_F(o, S_CONT)));   // a level of a texture
-    HTex *t = host_get(o);
+    HTex *t = (__bridge HTex *)host_get(o);     // strong: the creation path below assigns new objects to it
     if (!t) {
         if (kind == K_TEX || kind == K_CUBE) {
             t = make_tex(G32(OBJ_F(o, T_FMT)), G32(OBJ_F(o, T_W)), G32(OBJ_F(o, T_H)), G32(OBJ_F(o, T_LEVELS)), G32(OBJ_F(o, T_FACES)), 1,
@@ -202,9 +250,11 @@ static id<MTLTexture> surf_target(uint32_t s, NSUInteger *level, NSUInteger *sli
 @end
 
 static MTLCompileOptions *copts;
+static HShader *host_shader(uint32_t o) __attribute__((ns_returns_not_retained));
 static HShader *host_shader(uint32_t o) {
-    HShader *h = host_get(o);
-    if (h) return h;
+    __unsafe_unretained HShader *h0 = (__bridge HShader *)host_get(o);
+    if (h0) return h0;
+    HShader *h;
     h = [HShader new];
     char err[256];
     if (!sm_reflect((const uint32_t *)(void *)(MEM + G32(OBJ_F(o, 0))), G32(OBJ_F(o, 1)), &h->info, err, sizeof err)) {
@@ -215,6 +265,7 @@ static HShader *host_shader(uint32_t o) {
     host_set(o, h);
     return h;
 }
+static uint64_t stall_ns;                                   // time spent compiling shaders / pipelines
 static id<MTLFunction> shader_fn(uint32_t o, HShader *h, const uint16_t *extra, int n_extra, uint32_t depth_mask) {
     uint32_t key = depth_mask * 2654435761u;
     for (int i = 0; i < n_extra; i++) key = (key ^ extra[i]) * 16777619u;
@@ -224,7 +275,11 @@ static id<MTLFunction> shader_fn(uint32_t o, HShader *h, const uint16_t *extra, 
     char *msl = sm_translate((const uint32_t *)(void *)(MEM + G32(OBJ_F(o, 0))), G32(OBJ_F(o, 1)), &info, extra, n_extra, err, sizeof err);
     if (!msl) { fprintf(stderr, "[metal] translate failed: %s\n", err); return nil; }
     NSError *e = nil;
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:msl] options:copts error:&e];
+    uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+    stall_ns += dt;
+    if (dt > 4000000) fprintf(stderr, "[metal] shader compile %.1f ms (%s)\n", (double)dt / 1e6, h->info.is_ps ? "ps" : "vs");
     free(msl);
     if (!lib) { fprintf(stderr, "[metal] compile failed: %s\n", e.localizedDescription.UTF8String); return nil; }
     id<MTLFunction> f = [lib newFunctionWithName:h->info.is_ps ? @"pmain" : @"vmain"];
@@ -329,6 +384,7 @@ static void begin_pass(D3DState *s, uint32_t clear_flags, uint32_t color, float 
         }
     }
     enc = [cmd renderCommandEncoderWithDescriptor:rp];
+    ec_reset();
     memcpy(enc_rt, s->rt, sizeof enc_rt); enc_ds = s->ds;
 }
 static void ensure_pass(D3DState *s) {
@@ -404,7 +460,7 @@ static uint32_t pipe_count;
 typedef struct { uint32_t key; __unsafe_unretained id<MTLDepthStencilState> st; } DssEnt;
 static DssEnt dss_tab[4096];
 static NSMutableArray *dss_keep;
-static uint32_t last_vs_off, last_ps_off, last_ring_for_consts = 99;
+static uint32_t last_vs_off, last_ps_off, last_vs_n, last_ps_n, last_ring_for_consts = 99;
 
 static uint32_t decl_streams(D3DState *s) {
     uint32_t e = G32(OBJ_F(s->decl, 0)), n = G32(OBJ_F(s->decl, 1)), m = 0;
@@ -442,7 +498,7 @@ static int setup_draw(D3DState *s) {
         if (!memcmp(&e->k, &k, sizeof k)) { pe = e; break; }
     }
     if (!pe) return 0;
-    HShader *vs = host_shader(s->vs), *ps = host_shader(s->ps);
+    __unsafe_unretained HShader *vs = host_shader(s->vs), *ps = host_shader(s->ps);
     if (!vs || !ps) return 0;
     if (!pe->pso) {
         // miss: link the stages, translate/compile, describe vertices, build the pipeline
@@ -478,12 +534,16 @@ static int setup_draw(D3DState *s) {
         if (k.dsfmt) { pd.depthAttachmentPixelFormat = (MTLPixelFormat)k.dsfmt; if (k.dsfmt == MTLPixelFormatDepth32Float_Stencil8) pd.stencilAttachmentPixelFormat = (MTLPixelFormat)k.dsfmt; }
         pd.rasterSampleCount = k.samples ? k.samples : 1;
         NSError *e = nil;
+        uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         id<MTLRenderPipelineState> pso = [dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+        stall_ns += dt;
+        if (dt > 4000000) fprintf(stderr, "[metal] pipeline build %.1f ms\n", (double)dt / 1e6);
         if (!pso) { fprintf(stderr, "[metal] pipeline failed: %s\n", e.localizedDescription.UTF8String); return 0; }
         [pipe_keep addObject:pso];
         pe->k = k; pe->pso = pso; pe->streams = streams; pipe_count++;
     }
-    [enc setRenderPipelineState:pe->pso];
+    if (ec.pso != pe->pso) { [enc setRenderPipelineState:pe->pso]; ec.pso = pe->pso; }
 
     // depth / stencil
     uint32_t dkey = (s->rs[7] ? 1 : 0) | (s->rs[14] ? 2 : 0) | (s->rs[23] << 2) | (s->rs[52] ? 64 : 0) | (s->rs[56] << 7) | (s->rs[53] << 11) |
@@ -510,37 +570,55 @@ static int setup_draw(D3DState *s) {
         }
         if (e->key == dkey) { ds = e->st; break; }
     }
-    [enc setDepthStencilState:ds];
-    [enc setStencilReferenceValue:s->rs[57]];
-    [enc setFrontFacingWinding:MTLWindingClockwise];
-    [enc setCullMode:s->rs[22] == 2 ? MTLCullModeFront : s->rs[22] == 3 ? MTLCullModeBack : MTLCullModeNone];
-    [enc setTriangleFillMode:s->rs[8] == 2 ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+    if (ec.dss != ds) { [enc setDepthStencilState:ds]; ec.dss = ds; }
+    uint32_t cull = s->rs[22] == 2 ? MTLCullModeFront : s->rs[22] == 3 ? MTLCullModeBack : MTLCullModeNone;
+    uint32_t fill = s->rs[8] == 2 ? MTLTriangleFillModeLines : MTLTriangleFillModeFill;
     float bias, slope; memcpy(&bias, &s->rs[195], 4); memcpy(&slope, &s->rs[175], 4);
-    [enc setDepthBias:bias * 16777216.0f slopeScale:slope clamp:0];
     float vpz0, vpz1; memcpy(&vpz0, &s->viewport[4], 4); memcpy(&vpz1, &s->viewport[5], 4);
-    [enc setViewport:(MTLViewport){s->viewport[0], s->viewport[1], s->viewport[2], s->viewport[3], vpz0, vpz1}];
+    MTLViewport vp = {s->viewport[0], s->viewport[1], s->viewport[2], s->viewport[3], vpz0, vpz1};
+    if (!ec.fixed_valid) [enc setFrontFacingWinding:MTLWindingClockwise];
+    if (!ec.fixed_valid || ec.sref != s->rs[57]) { [enc setStencilReferenceValue:s->rs[57]]; ec.sref = s->rs[57]; }
+    if (!ec.fixed_valid || ec.cull != cull) { [enc setCullMode:(MTLCullMode)cull]; ec.cull = cull; }
+    if (!ec.fixed_valid || ec.fill != fill) { [enc setTriangleFillMode:(MTLTriangleFillMode)fill]; ec.fill = fill; }
+    if (!ec.fixed_valid || ec.bias != bias || ec.slope != slope) { [enc setDepthBias:bias * 16777216.0f slopeScale:slope clamp:0]; ec.bias = bias; ec.slope = slope; }
+    if (!ec.fixed_valid || memcmp(&ec.vp, &vp, sizeof vp)) { [enc setViewport:vp]; ec.vp = vp; }
     NSUInteger lv, sl; id<MTLTexture> rt0 = surf_target(s->rt[0], &lv, &sl);
     NSUInteger tw = rt0 ? MAX(1, rt0.width >> lv) : s->width, th = rt0 ? MAX(1, rt0.height >> lv) : s->height;
+    MTLScissorRect sc = {0, 0, tw, th};
     if (s->rs[174]) {
         int x0 = (int)s->scissor[0], y0 = (int)s->scissor[1], x1 = (int)s->scissor[2], y1 = (int)s->scissor[3];
         x0 = MAX(0, MIN(x0, (int)tw)); x1 = MAX(x0, MIN(x1, (int)tw)); y0 = MAX(0, MIN(y0, (int)th)); y1 = MAX(y0, MIN(y1, (int)th));
-        [enc setScissorRect:(MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)}];
-    } else [enc setScissorRect:(MTLScissorRect){0, 0, tw, th}];
+        sc = (MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)};
+    }
+    if (!ec.fixed_valid || memcmp(&ec.sc, &sc, sizeof sc)) { [enc setScissorRect:sc]; ec.sc = sc; }
     uint32_t bc = s->rs[193];
-    [enc setBlendColorRed:((bc >> 16) & 255) / 255.0f green:((bc >> 8) & 255) / 255.0f blue:(bc & 255) / 255.0f alpha:(bc >> 24) / 255.0f];
+    if (!ec.fixed_valid || ec.bc != bc) {
+        [enc setBlendColorRed:((bc >> 16) & 255) / 255.0f green:((bc >> 8) & 255) / 255.0f blue:(bc & 255) / 255.0f alpha:(bc >> 24) / 255.0f];
+        ec.bc = bc;
+    }
+    ec.fixed_valid = 1;
 
     // constants: re-upload only what changed since the last draw in this frame's ring
-    if (s->vsc_dirty || last_ring_for_consts != ring_idx) { last_vs_off = ring_put(s->vsc, sizeof s->vsc); s->vsc_dirty = 0; }
-    if (s->psc_dirty || last_ring_for_consts != ring_idx) { last_ps_off = ring_put(s->psc, sizeof s->psc); s->psc_dirty = 0; }
+    // only the registers the bound shaders read (max_const from reflection); re-upload when the game
+    // changed constants, the ring rotated, or this shader reads past what the last upload covered
+    uint32_t vn = (uint32_t)(vs->info.max_const + 1), pn = (uint32_t)(ps->info.max_const + 1);
+    if (vn > 256) vn = 256;
+    if (pn > 224) pn = 224;
+    if (s->vsc_dirty || last_ring_for_consts != ring_idx || vn > last_vs_n) {
+        last_vs_off = ring_put(s->vsc, (vn ? vn : 1) * 16); last_vs_n = vn; s->vsc_dirty = 0;
+    }
+    if (s->psc_dirty || last_ring_for_consts != ring_idx || pn > last_ps_n) {
+        last_ps_off = ring_put(s->psc, (pn ? pn : 1) * 16); last_ps_n = pn; s->psc_dirty = 0;
+    }
     last_ring_for_consts = ring_idx;
-    [enc setVertexBuffer:ring[ring_idx] offset:last_vs_off atIndex:20];
-    [enc setVertexBytes:s->vsi length:sizeof s->vsi atIndex:21];
-    [enc setVertexBytes:s->vsb length:sizeof s->vsb atIndex:22];
+    ec_vbuf(ring[ring_idx], last_vs_off, 20);
+    ec_vbytes(s->vsi, sizeof s->vsi, 21);
+    ec_vbytes(s->vsb, sizeof s->vsb, 22);
     float vsys[4] = {s->viewport[2] ? -1.0f / (float)s->viewport[2] : 0, s->viewport[3] ? 1.0f / (float)s->viewport[3] : 0, 0, 0};
-    [enc setVertexBytes:vsys length:sizeof vsys atIndex:23];
-    [enc setFragmentBuffer:ring[ring_idx] offset:last_ps_off atIndex:0];
-    [enc setFragmentBytes:s->psi length:sizeof s->psi atIndex:1];
-    [enc setFragmentBytes:s->psb length:sizeof s->psb atIndex:2];
+    ec_vbytes(vsys, sizeof vsys, 23);
+    ec_fbuf(ring[ring_idx], last_ps_off, 0);
+    ec_fbytes(s->psi, sizeof s->psi, 1);
+    ec_fbytes(s->psb, sizeof s->psb, 2);
     struct { uint32_t alpha_func; float alpha_ref; uint32_t fog_mode, fog_enable; float fog_color[4]; float fog_params[4]; uint32_t fog_table, p0, p1, p2; } psys;
     psys.alpha_func = s->rs[15] ? s->rs[25] : 8; psys.alpha_ref = (float)(s->rs[24] & 255) / 255.0f;
     psys.fog_enable = s->rs[28] && ps->info.major < 3; psys.fog_table = s->rs[35] != 0; psys.fog_mode = s->rs[35] ? s->rs[35] : s->rs[140];
@@ -548,22 +626,50 @@ static int setup_draw(D3DState *s) {
     psys.fog_color[0] = ((fc >> 16) & 255) / 255.0f; psys.fog_color[1] = ((fc >> 8) & 255) / 255.0f; psys.fog_color[2] = (fc & 255) / 255.0f; psys.fog_color[3] = 1;
     memcpy(&psys.fog_params[0], &s->rs[36], 4); memcpy(&psys.fog_params[1], &s->rs[37], 4); memcpy(&psys.fog_params[2], &s->rs[38], 4); psys.fog_params[3] = 0;
     psys.p0 = psys.p1 = psys.p2 = 0;
-    [enc setFragmentBytes:&psys length:sizeof psys atIndex:3];
+    _Static_assert(sizeof psys <= 256, "psys");
+    ec_fbytes(&psys, sizeof psys, 3);
 
     for (int i = 0; i < 16; i++) {
         if (!(ps->info.samplers & (1u << i))) continue;
-        HTex *t = host_tex(s->tex[i]);
+        __unsafe_unretained HTex *t = host_tex(s->tex[i]);
         if (!t) continue;
-        [enc setFragmentTexture:(k.depth_mask >> i) & 1 ? t.tex : t.view atIndex:i];
-        [enc setFragmentSamplerState:sampler(s, i, 0) atIndex:i];
-        if ((k.depth_mask >> i) & 1) [enc setFragmentSamplerState:sampler(s, i, 1) atIndex:i + 16];
+        id<MTLTexture> tv = (k.depth_mask >> i) & 1 ? t.tex : t.view;
+        if (ec.ftex[i] != tv) { [enc setFragmentTexture:tv atIndex:i]; ec.ftex[i] = tv; }
+        id<MTLSamplerState> sm = sampler(s, i, 0);
+        if (ec.fsamp[i] != sm) { [enc setFragmentSamplerState:sm atIndex:i]; ec.fsamp[i] = sm; }
+        if ((k.depth_mask >> i) & 1) {
+            id<MTLSamplerState> sc2 = sampler(s, i, 1);
+            if (ec.fsamp[i + 16] != sc2) { [enc setFragmentSamplerState:sc2 atIndex:i + 16]; ec.fsamp[i + 16] = sc2; }
+        }
     }
     for (int i = 0; i < 4; i++) {
         if (!(vs->info.samplers & (1u << i))) continue;
-        HTex *t = host_tex(s->tex[16 + i]);
-        if (t) { [enc setVertexTexture:t.view atIndex:i]; [enc setVertexSamplerState:sampler(s, 16 + i, 0) atIndex:i]; }
+        __unsafe_unretained HTex *t = host_tex(s->tex[16 + i]);
+        if (t) {
+            if (ec.vtex[i] != t.view) { [enc setVertexTexture:t.view atIndex:i]; ec.vtex[i] = t.view; }
+            id<MTLSamplerState> sm = sampler(s, 16 + i, 0);
+            if (ec.vsamp[i] != sm) { [enc setVertexSamplerState:sm atIndex:i]; ec.vsamp[i] = sm; }
+        }
     }
     return (int)pe->streams | 0x10000;
+}
+
+// A static buffer's GPU copy, or nil when it must go through the ring (dynamic / keeps changing).
+#define BUF_STREAMING 8u                                     // uploads after which a buffer counts as streaming
+static id<MTLBuffer> static_buf(uint32_t b) __attribute__((ns_returns_not_retained));
+static id<MTLBuffer> static_buf(uint32_t b) {
+    if (G32(OBJ_F(b, B_USAGE)) & 0x200) return nil;            // D3DUSAGE_DYNAMIC
+    uint32_t ups = G32(OBJ_F(b, B_UPS));
+    if (ups >= BUF_STREAMING) return nil;
+    __unsafe_unretained id<MTLBuffer> h = (__bridge id<MTLBuffer>)host_get(b);
+    if (h && !G32(OBJ_F(b, B_DIRTY))) return h;
+    uint32_t len = G32(OBJ_F(b, B_LEN));
+    if (!len) return nil;
+    P32(OBJ_F(b, B_DIRTY), 0); P32(OBJ_F(b, B_UPS), ups + 1);
+    if (ups + 1 >= BUF_STREAMING) return nil;
+    id<MTLBuffer> m = [dev newBufferWithBytes:MEM + G32(OBJ_F(b, B_DATA)) length:len options:MTLResourceStorageModeShared];
+    host_set(b, m);
+    return m;
 }
 
 static void bind_streams(D3DState *s, uint32_t streams, uint32_t first_vertex, uint32_t nverts) {
@@ -575,8 +681,10 @@ static void bind_streams(D3DState *s, uint32_t streams, uint32_t first_vertex, u
         uint32_t start = s->stream_off[st] + first_vertex * stride, n = nverts * stride + 64;
         if (start >= len) continue;
         if (start + n > len) n = len - start;
+        __unsafe_unretained id<MTLBuffer> sb = (start & 3) ? nil : static_buf(b);
+        if (sb) { ec_vbuf(sb, start, st); continue; }
         uint32_t off = ring_put(MEM + data + start, n);
-        [enc setVertexBuffer:ring[ring_idx] offset:off atIndex:st];
+        ec_vbuf(ring[ring_idx], off, st);
     }
 }
 
@@ -603,9 +711,10 @@ static void d3d_backend_draw_impl(D3DState *s, uint32_t prim, uint32_t start, ui
         uint32_t isz = i32 ? 4 : 2, idata = G32(OBJ_F(ib, B_DATA));
         // vertices the indices can touch: [base+min, base+min+num_vertices)
         bind_streams(s, (uint32_t)r & 0xFFFF, (uint32_t)(base_vertex + (int32_t)min_index), num_vertices);
-        uint32_t ioff = ring_put(MEM + idata + start * isz, n * isz);
         if (kind == 2) return;   // indexed fans: not used by FNV
-        [enc drawIndexedPrimitives:pt indexCount:n indexType:i32 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:ring[ring_idx]
+        __unsafe_unretained id<MTLBuffer> ibuf = ((start * isz) & 3) ? nil : static_buf(ib);
+        uint32_t ioff = ibuf ? start * isz : ring_put(MEM + idata + start * isz, n * isz);
+        [enc drawIndexedPrimitives:pt indexCount:n indexType:i32 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:ibuf ? ibuf : ring[ring_idx]
                  indexBufferOffset:ioff instanceCount:1 baseVertex:-(NSInteger)min_index baseInstance:0];
     }
     draws_done++;
@@ -624,7 +733,7 @@ static void d3d_backend_draw_up_impl(D3DState *s, uint32_t prim, uint32_t count,
     if (!kind) return;
     uint32_t nv = idata ? min_index + num_vertices : n;
     uint32_t off = ring_put(MEM + vdata, nv * vstride);
-    [enc setVertexBuffer:ring[ring_idx] offset:off atIndex:0];
+    ec_vbuf(ring[ring_idx], off, 0);
     if (idata) {
         uint32_t isz = ifmt == 102 ? 4 : 2, ioff = ring_put(MEM + idata, n * isz);
         [enc drawIndexedPrimitives:pt indexCount:n indexType:isz == 4 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:ring[ring_idx] indexBufferOffset:ioff];
@@ -714,21 +823,53 @@ static void d3d_backend_colorfill_impl(D3DState *s, uint32_t surf, uint32_t rect
 static void d3d_backend_readback_impl(D3DState *s, uint32_t rt, uint32_t dst) { (void)s; (void)rt; (void)dst; }   // TODO: screenshots / GPU readback
 
 // ---- resource lifetime --------------------------------------------------------------------------------
-static void d3d_backend_created_impl(uint32_t o) { (void)o; }
+// Shader prewarm: the game creates (nearly) all its shaders at boot. Translate each one's default
+// variant now and compile it on background threads; the compiled result lands in Metal's on-disk
+// shader cache, so the draw-time compile of that variant later is a cache hit instead of a stall of
+// up to ~130 ms. Results are discarded here; FNV_NO_PREWARM=1 disables.
+static void prewarm_shader(uint32_t o) {
+    static int off = -1;
+    static dispatch_queue_t q; static dispatch_semaphore_t width;
+    if (off < 0) {
+        off = getenv("FNV_NO_PREWARM") != NULL;
+        q = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+        width = dispatch_semaphore_create(4);
+    }
+    if (off) return;
+    SMInfo info; char err[256];
+    const uint32_t *tok = (const uint32_t *)(void *)(MEM + G32(OBJ_F(o, 0)));
+    uint32_t ntok = G32(OBJ_F(o, 1));
+    if (!sm_reflect(tok, ntok, &info, err, sizeof err)) return;
+    info.depth_mask_in = 0;
+    char *msl = sm_translate(tok, ntok, &info, NULL, 0, err, sizeof err);
+    if (!msl) return;
+    NSString *src = [NSString stringWithUTF8String:msl];
+    free(msl);
+    dispatch_async(q, ^{
+        dispatch_semaphore_wait(width, DISPATCH_TIME_FOREVER);
+        @autoreleasepool { (void)[dev newLibraryWithSource:src options:copts error:nil]; }
+        dispatch_semaphore_signal(width);
+    });
+}
+static void d3d_backend_created_impl(uint32_t o) {
+    if (o && (OBJ_KIND(o) == K_VS || OBJ_KIND(o) == K_PS)) prewarm_shader(o);
+}
 static void d3d_backend_dirty_impl(uint32_t o) {
-    if (!o || OBJ_KIND(o) != K_SURF) return;               // buffers are re-read every draw
+    if (!o) return;
+    if (OBJ_KIND(o) == K_VB || OBJ_KIND(o) == K_IB) { P32(OBJ_F(o, B_DIRTY), 1); return; }
+    if (OBJ_KIND(o) != K_SURF) return;
     P32(OBJ_F(o, S_DIRTY), 1);
     uint32_t cont = G32(OBJ_F(o, S_CONT));
     if (cont) P32(OBJ_F(cont, T_DIRTY), 1);
 }
 static void d3d_backend_release_impl(uint32_t o) {
     uint32_t k = OBJ_KIND(o);
-    if (k != K_TEX && k != K_CUBE && k != K_SURF && k != K_VS && k != K_PS) return;
+    if (k != K_TEX && k != K_CUBE && k != K_SURF && k != K_VS && k != K_PS && k != K_VB && k != K_IB) return;
     uint32_t i = G32(host_field(o));
     if (!i) return;
-    hostobjs[i - 1] = [NSNull null];
-    [free_slots addObject:@(i - 1)];
-    P32(host_field(o), 0);
+    if (k == K_TEX || k == K_CUBE || k == K_SURF) { memset(ec.ftex, 0, sizeof ec.ftex); memset(ec.vtex, 0, sizeof ec.vtex); }
+    if (k == K_VB || k == K_IB) memset(ec.vbuf, 0, sizeof ec.vbuf);
+    host_drop(o);
 }
 
 // ---- window / present ---------------------------------------------------------------------------------
@@ -770,16 +911,93 @@ static void dump_png(id<MTLTexture> src, uint64_t frame) {
     fprintf(stderr, "[metal] dumped %s (%zux%zu)\n", path, w, h);
 }
 
+// ---- recorder ---------------------------------------------------------------------------------------------
+// FNV_RECORD=<file.mov> : every presented frame is scaled on the GPU into a pooled CVPixelBuffer and
+// appended to a hardware H.264 stream with its wall-clock timestamp. Fragmented, so a killed run still
+// leaves a playable file. FNV_RECORD_SIZE=WxH (default 1920x1080).
+static AVAssetWriter *rec_writer;
+static AVAssetWriterInput *rec_input;
+static AVAssetWriterInputPixelBufferAdaptor *rec_adaptor;
+static CVMetalTextureCacheRef rec_cache;
+static dispatch_queue_t rec_q;
+static uint64_t rec_t0, rec_frames, rec_dropped;
+static int rec_w, rec_h, rec_on;
+static void rec_finish(void) {
+    if (!rec_on) return;
+    rec_on = 0;
+    dispatch_sync(rec_q, ^{});
+    [rec_input markAsFinished];
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    [rec_writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(done); }];
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC));
+    fprintf(stderr, "[rec] finished %s: %llu frames, %llu dropped, status %ld\n", rec_writer.outputURL.path.UTF8String,
+            (unsigned long long)rec_frames, (unsigned long long)rec_dropped, (long)rec_writer.status);
+}
+static void rec_init(void) {
+    const char *path = getenv("FNV_RECORD");
+    if (!path) return;
+    rec_w = 1920; rec_h = 1080;
+    const char *sz = getenv("FNV_RECORD_SIZE");
+    if (sz) sscanf(sz, "%dx%d", &rec_w, &rec_h);
+    NSURL *url = [NSURL fileURLWithPath:@(path)];
+    [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+    NSError *err = nil;
+    rec_writer = [AVAssetWriter assetWriterWithURL:url fileType:AVFileTypeQuickTimeMovie error:&err];
+    if (!rec_writer) { fprintf(stderr, "[rec] %s\n", err.localizedDescription.UTF8String); return; }
+    rec_writer.movieFragmentInterval = CMTimeMake(5, 1);
+    NSDictionary *vs = @{AVVideoCodecKey: AVVideoCodecTypeH264, AVVideoWidthKey: @(rec_w), AVVideoHeightKey: @(rec_h),
+                         AVVideoCompressionPropertiesKey: @{AVVideoAverageBitRateKey: @(16000000), AVVideoExpectedSourceFrameRateKey: @60,
+                                                            AVVideoMaxKeyFrameIntervalKey: @120}};
+    rec_input = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:vs];
+    rec_input.expectsMediaDataInRealTime = YES;
+    rec_adaptor = [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:rec_input
+        sourcePixelBufferAttributes:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA), (id)kCVPixelBufferWidthKey: @(rec_w),
+                                      (id)kCVPixelBufferHeightKey: @(rec_h), (id)kCVPixelBufferMetalCompatibilityKey: @YES,
+                                      (id)kCVPixelBufferIOSurfacePropertiesKey: @{}}];
+    [rec_writer addInput:rec_input];
+    if (![rec_writer startWriting]) { fprintf(stderr, "[rec] startWriting: %s\n", rec_writer.error.localizedDescription.UTF8String); return; }
+    [rec_writer startSessionAtSourceTime:kCMTimeZero];
+    CVMetalTextureCacheCreate(NULL, NULL, dev, NULL, &rec_cache);
+    rec_q = dispatch_queue_create("fnv.rec", DISPATCH_QUEUE_SERIAL);
+    rec_on = 1;
+    atexit(rec_finish);
+    fprintf(stderr, "[rec] recording %dx%d to %s\n", rec_w, rec_h, path);
+}
+// called inside present, before the command buffer is committed
+static void rec_frame(id<MTLTexture> src) {
+    if (!rec_on || !src || src.sampleCount > 1) return;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (!rec_t0) rec_t0 = now;
+    if (!rec_input.readyForMoreMediaData || !rec_adaptor.pixelBufferPool) { rec_dropped++; return; }
+    CVPixelBufferRef pb = NULL;
+    if (CVPixelBufferPoolCreatePixelBuffer(NULL, rec_adaptor.pixelBufferPool, &pb) != kCVReturnSuccess) { rec_dropped++; return; }
+    CVMetalTextureRef mt = NULL;
+    CVMetalTextureCacheCreateTextureFromImage(NULL, rec_cache, pb, NULL, MTLPixelFormatBGRA8Unorm, (size_t)rec_w, (size_t)rec_h, 0, &mt);
+    id<MTLTexture> dst = mt ? CVMetalTextureGetTexture(mt) : nil;
+    if (!dst) { if (mt) CFRelease(mt); CVPixelBufferRelease(pb); rec_dropped++; return; }
+    blit(src, dst, 0, 0, 1);
+    CMTime t = CMTimeMake((int64_t)((now - rec_t0) / 1000), 1000000);
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        (void)b;
+        dispatch_async(rec_q, ^{
+            if (rec_on && rec_input.readyForMoreMediaData && [rec_adaptor appendPixelBuffer:pb withPresentationTime:t]) rec_frames++;
+            else rec_dropped++;
+            CFRelease(mt); CVPixelBufferRelease(pb);
+        });
+    }];
+}
+
 void d3d_backend_init(D3DState *s) {
     trace_metal = getenv("FNV_TRACE_METAL") != NULL;
     dev = MTLCreateSystemDefaultDevice();
     queue = [dev newCommandQueue];
     copts = [MTLCompileOptions new];
     copts.mathMode = MTLMathModeSafe;
-    hostobjs = [NSMutableArray array]; free_slots = [NSMutableArray array];
+
     pipe_tab = calloc(PIPE_TAB, sizeof *pipe_tab); pipe_keep = [NSMutableArray array];
     samp_keep = [NSMutableArray array]; dss_keep = [NSMutableArray array];
     for (int i = 0; i < 3; i++) ring[i] = [dev newBufferWithLength:RING_SIZE options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
+    rec_init();
     inflight = dispatch_semaphore_create(3);
 
     if (getenv("FNV_HEADLESS")) {          // offscreen: real rendering, no window, no focus change
@@ -877,6 +1095,7 @@ static void d3d_backend_present_impl(D3DState *s) {
         HTex *bb = host_tex(s->backbuffer);
         if (bb && (want_dump(s->frames + 1) || input_take_dump_request())) dump_png(bb.tex, s->frames + 1);
         if (drawable && bb) blit(bb.tex, drawable.texture, 0, 0, 1);
+        if (bb) rec_frame(bb.tex);
         if (drawable) [cmd presentDrawable:drawable];
         dispatch_semaphore_t sem = inflight;
         [cmd addCompletedHandler:^(id<MTLCommandBuffer> b) { (void)b; dispatch_semaphore_signal(sem); }];

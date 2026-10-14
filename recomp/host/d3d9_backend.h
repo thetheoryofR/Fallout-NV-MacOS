@@ -40,3 +40,8 @@ void d3d_backend_stretch(D3DState *s, uint32_t src, uint32_t srect, uint32_t dst
 void d3d_backend_colorfill(D3DState *s, uint32_t surf, uint32_t rect, uint32_t color);
 void d3d_backend_readback(D3DState *s, uint32_t rt, uint32_t dst);
 void d3d_backend_present(D3DState *s);
+
+// surface bytes (d3d9.c), wherever they currently live — NULL if never written. The residency lock is
+// held from begin to end.
+const uint8_t *d3d_surf_begin(uint32_t surf);
+void d3d_surf_end(void);

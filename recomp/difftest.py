@@ -233,7 +233,7 @@ class Worker:
         if top != 0:
             mant, exp = mu.reg_read(UC_X86_REG_FP0 + top)
             off, _ = self.R["ST0"]
-            a = f80_bytes_to_float(bytes(self.cpu[off:off + 10]))
+            a = struct.unpack("<d", bytes(self.cpu[off:off + 8]))[0]     # x87 registers are doubles
             b = f80_to_float(mant, exp)
             if not feq(a, b):
                 diffs.append(f"ST0 native={a!r} x86={b!r}")

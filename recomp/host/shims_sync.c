@@ -173,6 +173,7 @@ extern int host_run_guest(CPU *c, uint32_t entry);   // host.c: trap-guarded cal
 
 static void *thread_main(void *p) {
     ThreadStart *ts = p;
+    if (!getenv("FNV_NO_QOS")) pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);   // game workers
     pthread_mutex_lock(&ts->obj->m);                      // CREATE_SUSPENDED: wait for ResumeThread
     while (ts->obj->suspend > 0) pthread_cond_wait(&ts->obj->cv, &ts->obj->m);
     pthread_mutex_unlock(&ts->obj->m);

@@ -528,6 +528,16 @@ static void fill_info(Ctx *c, SMInfo *info) {
     info->n_io = c->nio < 16 ? c->nio : 16;
     for (int i = 0; i < 16; i++) { info->sampler_dim[i] = (uint8_t)c->samp_dim[i]; if (c->samp_dim[i]) info->samplers |= 1u << i; }
     info->writes_depth = c->writes_depth; info->uses_relative = c->uses_addr; info->n_color_out = c->ncolor;
+    // highest float constant register read (-1: none); relative addressing or banked ps_1 constants can
+    // reach any register, so report the whole file
+    info->max_const = -1;
+    for (int k = 0; k < c->nins; k++)
+        for (int j = 0; j < c->ins[k].nsrc; j++) {
+            const Src *sp = &c->ins[k].src[j];
+            if (sp->type == RT_CONST) { if (sp->rel) info->max_const = 255; else if (sp->num > info->max_const) info->max_const = sp->num; }
+            else if (sp->type == RT_CONST2 || sp->type == RT_CONST3 || sp->type == RT_CONST4) info->max_const = 255;
+        }
+    if (c->uses_addr) info->max_const = 255;
 }
 
 // ---- top level -----------------------------------------------------------------------------------

@@ -21,6 +21,8 @@ void host_thread_init(CPU *c, uint32_t stack_size);
 void rt_import_call(CPU *c, uint32_t addr);
 
 // guest memory helpers
+extern uint8_t *host_tls_template;                // static TLS template (NULL: the image has none)
+extern uint32_t host_tls_template_size, host_tls_block_size;
 static inline uint32_t G32(uint32_t a) { uint32_t v; memcpy(&v, MEM + a, 4); return v; }
 static inline void P32(uint32_t a, uint32_t v) { memcpy(MEM + a, &v, 4); }
 static inline char *GSTR(uint32_t a) { return a ? (char *)MEM + a : NULL; }

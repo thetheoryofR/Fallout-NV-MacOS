@@ -1,0 +1,8 @@
+{
+  "game": "Fallout: New Vegas",
+  "system": "PC (Windows)",
+  "type": "recomp",
+  "status": "playable",
+  "targets": ["macOS"],
+  "toolchain": ["Ghidra", "Unicorn"]
+}

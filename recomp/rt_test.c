@@ -4,7 +4,9 @@
 #include <sys/mman.h>
 #include "rt.h"
 
+#ifndef RT_FIXED_MEM
 uint8_t *MEM;
+#endif
 int64_t rt_budget;
 static jmp_buf trap_jb;
 static int trap_code;
@@ -22,12 +24,22 @@ void rt_trap(CPU *c, int code, uint32_t addr) {
 }
 
 uint8_t *rt_mem(void) {
+#ifdef RT_FIXED_MEM
+    static uint8_t *m;
+    if (!m) {
+        void *p = mmap((void *)RT_MEM_BASE, (size_t)1 << 32, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+        m = p == (void *)RT_MEM_BASE ? (uint8_t *)p : NULL;
+    }
+    return m;
+#else
     if (!MEM) {
         void *p = mmap(NULL, (size_t)1 << 32, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
         MEM = p == MAP_FAILED ? NULL : (uint8_t *)p;
     }
     return MEM;
+#endif
 }
 int rt_count(void) { return rt_fn_count; }
 uint32_t rt_addr(int i) { return rt_fn_addr[i]; }

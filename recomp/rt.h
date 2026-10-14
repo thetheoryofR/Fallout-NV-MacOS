@@ -22,7 +22,15 @@ typedef struct CPU { uint8_t r[REGFILE_SIZE]; } CPU;
 #define TOPADJ(R, d) ((R)[REG_TOP] = (uint8_t)(((R)[REG_TOP] + (d)) & 7))
 #define SYNC_FPUSW(R) ST((R) + REG_FPUSW, (LD((R) + REG_FPUSW, 2) & ~(U)0x3800) | ((U)(R)[REG_TOP] << 11), 2)
 
-extern uint8_t *MEM;          // base of the 4 GB guest address space
+// Base of the 4 GB guest address space. The host maps it at RT_MEM_BASE; generated code built with
+// -DRT_FIXED_MEM uses that constant instead of loading the pointer (a byte store could alias the
+// global, so the compiler would otherwise reload it before nearly every guest access).
+#define RT_MEM_BASE 0x300000000000ULL
+#ifdef RT_FIXED_MEM
+#define MEM ((uint8_t *)RT_MEM_BASE)
+#else
+extern uint8_t *MEM;
+#endif
 extern int64_t rt_budget;     // loop guard: decremented on every taken branch
 typedef void (*GuestFn)(CPU *);
 
@@ -163,6 +171,22 @@ static inline V FTRUNCV(double d, int n) {
 // Every guest load is an acquire, every guest store a release (LDAPR / STLR on Apple Silicon), so
 // the game's lock-free code sees stores in program order like on x86, and spin-loops re-read
 // memory. Misaligned and wide accesses use a plain copy bracketed by full fences.
+#ifdef RT_NO_TSO   // measurement only: plain accesses (unsafe for the game's lock-free code)
+static inline V LDM(uint32_t a, int n) { V v = 0; memcpy(&v, MEM + a, n); return v; }
+static inline void STM(uint32_t a, V v, int n) { memcpy(MEM + a, &v, n); }
+#else
+#if defined(RT_TSO_RELAXED_LOADS)   // measurement: loads plain (still re-read: relaxed atomics)
+static inline V LDM(uint32_t a, int n) {
+    uint8_t *p = MEM + a;
+    switch (n) {
+    case 1: return __atomic_load_n(p, __ATOMIC_RELAXED);
+    case 2: return __atomic_load_n((uint16_t *)(void *)p, __ATOMIC_RELAXED);
+    case 4: return __atomic_load_n((uint32_t *)(void *)p, __ATOMIC_RELAXED);
+    case 8: return __atomic_load_n((uint64_t *)(void *)p, __ATOMIC_RELAXED);
+    }
+    V v = 0; memcpy(&v, p, n); return v;
+}
+#else
 static inline V LDM(uint32_t a, int n) {
     uint8_t *p = MEM + a;
     switch (n) {
@@ -173,6 +197,19 @@ static inline V LDM(uint32_t a, int n) {
     }
     V v = 0; memcpy(&v, p, n); __atomic_thread_fence(__ATOMIC_ACQUIRE); return v;
 }
+#endif
+#if defined(RT_TSO_RELAXED_STORES)   // measurement: stores plain
+static inline void STM(uint32_t a, V v, int n) {
+    uint8_t *p = MEM + a;
+    switch (n) {
+    case 1: __atomic_store_n(p, (uint8_t)v, __ATOMIC_RELAXED); return;
+    case 2: __atomic_store_n((uint16_t *)(void *)p, (uint16_t)v, __ATOMIC_RELAXED); return;
+    case 4: __atomic_store_n((uint32_t *)(void *)p, (uint32_t)v, __ATOMIC_RELAXED); return;
+    case 8: __atomic_store_n((uint64_t *)(void *)p, (uint64_t)v, __ATOMIC_RELAXED); return;
+    }
+    memcpy(p, &v, n);
+}
+#else
 static inline void STM(uint32_t a, V v, int n) {
     uint8_t *p = MEM + a;
     switch (n) {
@@ -183,7 +220,28 @@ static inline void STM(uint32_t a, V v, int n) {
     }
     __atomic_thread_fence(__ATOMIC_RELEASE); memcpy(p, &v, n);
 }
+#endif
+#endif
 static inline U LDMW(uint32_t a, int n) { U v = 0; memcpy(&v, MEM + a, n); __atomic_thread_fence(__ATOMIC_ACQUIRE); return v; }
 static inline void STMW(uint32_t a, U v, int n) { __atomic_thread_fence(__ATOMIC_RELEASE); memcpy(MEM + a, &v, n); }
 void rt_lock(void);
+// RT_X87CHECK: report calls / returns made with more x87 values live than the ABI allows
+#ifdef RT_X87CHECK
+void rt_x87_violation(uint32_t at, int depth, int allowed);
+#define X87CHK(at, allowed) do { int _d = (8 - R[REG_TOP]) & 7; if (_d > (allowed)) rt_x87_violation((at), _d, (allowed)); } while (0)
+#else
+#define X87CHK(at, allowed) ((void)0)
+#endif
 void rt_unlock(void);
+
+// ---- x87 registers as doubles ----------------------------------------------------------------
+// ST0..ST7 live in the register file as 8-byte doubles (offsets 4352 + 16*i). 80-bit extended
+// format exists only where x87 data meets guest memory (FLD/FSTP tbyte, FSAVE...).
+typedef double F;
+static inline F LDF(const uint8_t *p) { F d; memcpy(&d, p, 8); return d; }
+static inline void STF(uint8_t *p, F d) { memcpy(p, &d, 8); }
+static inline F LDMF(uint32_t a) { F d = f80_get(MEM + a); __atomic_thread_fence(__ATOMIC_ACQUIRE); return d; }
+static inline void STMF(uint32_t a, F d) { __atomic_thread_fence(__ATOMIC_RELEASE); f80_put(MEM + a, d); }
+static inline U F2U(F d) { U v = 0; uint8_t b[16] = {0}; f80_put(b, d); memcpy(&v, b, 16); return v; }
+static inline F U2F(U v) { uint8_t b[16]; memcpy(b, &v, 16); return f80_get(b); }
+#define FBIND(OP, x, y) ({ F _x = (x), _y = (y); isnan(_x) ? _x : isnan(_y) ? _y : XNAN(_x OP _y); })

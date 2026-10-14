@@ -1,7 +1,7 @@
 # byog-recomp — bring-your-own-game static recompiler for 32-bit x86
 
 Translates the machine code of a 32-bit Windows (x86) game into C that compiles natively for
-Apple Silicon (arm64), and **proves each translated function correct** by running the original
+Apple Silicon (arm64), runs it on a native host (Win32/COM shims, Direct3D 9 → Metal, input), and **proves each translated function correct** by running the original
 instructions in an emulator from the same randomised state and comparing every register, flag and
 byte of memory.
 
@@ -10,19 +10,22 @@ supply an executable you own; everything the tools produce from it stays on your
 
 ## Status
 
-Milestone 0 (lifter proof), measured on the leaf functions of one 2010 PC RPG (3.5 M instructions,
-63k functions):
+**Fallout: New Vegas (PC, 2010) runs natively on Apple Silicon macOS** — no Wine or CrossOver: the
+whole executable (93,500 functions) is translated ahead of time to arm64, Direct3D 9 goes to Metal,
+and the game's own shaders are translated SM1-3 → Metal Shading Language at run time. (An embedded
+Unicorn interpreter is only a safety net for code the analysis missed.)
 
-| | functions |
-| :--- | ---: |
-| leaf functions translated | 9,710 of 9,866 |
-| match the original exactly (6 random trials each) | **8,767 of 8,830 testable (99.3%)** |
-| differ only in CPU flags | 36 |
-| fail | 27 |
-| crash | 0 |
+- One uninterrupted, recorded hour of scripted play (Goodsprings start, travel across 13 world
+  cells): no crashes, flat memory, **mean 84 fps** at 3456×1944. ~96% of time at or above 60 fps;
+  the heaviest cells (2,000-2,800 draws/frame) still dip to 53-59 fps.
+- Every translated function can be differential-tested against the original x86 in Unicorn.
+- Not done yet: audio (DirectSound is silent), Bink video, gamepad, the fixed-function pipeline,
+  NVSE / script-extender mods.
 
-Next: whole-program translation (calls, C++ virtual dispatch, switch tables), then OS/graphics
-shims. See [`docs/DESIGN.md`](docs/DESIGN.md).
+You need your own DRM-free copy of the game (see below). Nothing in this repository works without it.
+
+Milestone 0 (lifter proof) on leaf functions: 8,767 of 8,830 testable functions match the original
+exactly (99.3%), 0 crashes. Design notes: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## How it works
 

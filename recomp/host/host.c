@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <pthread.h>
+#include <pthread/qos.h>
 #include "../rt.h"
 #include "host.h"
 int host_run_guest(CPU *c, uint32_t entry);
@@ -107,18 +109,39 @@ static uint32_t load_pe(const char *path) {
         uint32_t take = rs < vs || !vs ? rs : vs;
         memcpy(MEM + base + va, d + rp, take);
     }
+    // static TLS (__declspec(thread)): snapshot the template; host_thread_init gives every thread its
+    // own copy in TLS array[index], as the Windows loader does
+    uint32_t tls_rva; memcpy(&tls_rva, d + pe + 24 + 96 + 9 * 8, 4);
+    if (tls_rva) {
+        uint32_t td[5]; memcpy(td, MEM + base + tls_rva, sizeof td);   // start, end, &index, &callbacks, zerofill
+        host_tls_template_size = td[1] - td[0];
+        host_tls_block_size = host_tls_template_size + td[4];
+        host_tls_template = malloc(host_tls_template_size + 1);
+        memcpy(host_tls_template, MEM + td[0], host_tls_template_size);
+        P32(td[2], 0);                                                    // our module's TLS index
+        uint32_t cb = td[3] ? G32(td[3]) : 0;
+        fprintf(stderr, "[host] static TLS: %u-byte template + %u zero-fill%s\n", host_tls_template_size, td[4],
+                cb ? " (TLS callbacks present: NOT run)" : "");
+    }
     free(d);
     host_image_base = base;
     return base + ep;
 }
 
 uint32_t host_image_base;
+uint8_t *host_tls_template;
+uint32_t host_tls_template_size, host_tls_block_size;
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s game.exe [args]\n", argv[0]); return 2; }
-    void *p = mmap(NULL, (size_t)1 << 32, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    // at RT_MEM_BASE, so code compiled with RT_FIXED_MEM can address guest memory by constant
+    void *p = mmap((void *)RT_MEM_BASE, (size_t)1 << 32, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) { perror("mmap 4GB"); return 1; }
+    if (p != (void *)RT_MEM_BASE) { fprintf(stderr, "[host] guest space landed at %p, not %#llx\n", p, RT_MEM_BASE); return 1; }
     MEM = p;
+    // the game's main thread runs the frame: keep it on performance cores ahead of the game's workers
+    // (a CLI process otherwise starts at default QoS and can land on efficiency cores)
+    if (!getenv("FNV_NO_QOS")) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     host_init_args(argc - 1, argv + 1);
     uint32_t entry = load_pe(argv[1]);
     bind_imports(host_image_base);

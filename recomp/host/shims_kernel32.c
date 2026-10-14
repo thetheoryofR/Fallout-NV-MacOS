@@ -36,8 +36,14 @@ void host_thread_init(CPU *c, uint32_t stack_size) {
     P32(teb + 0x08, stack);                    // stack limit
     P32(teb + 0x18, teb);                      // self
     P32(teb + 0x20, (uint32_t)getpid());       // ClientId.UniqueProcess
-    P32(teb + 0x24, 1);                        // ClientId.UniqueThread (main thread)
+    static uint32_t next_tid = 1;
+    P32(teb + 0x24, __atomic_fetch_add(&next_tid, 1, __ATOMIC_RELAXED));   // ClientId.UniqueThread
     P32(teb + 0x2C, teb + 0x1000);             // ThreadLocalStoragePointer (static TLS array)
+    if (host_tls_template) {                   // this thread's copy of the static TLS block, slot 0
+        uint32_t blk = gmalloc(host_tls_block_size ? host_tls_block_size : 4);
+        memcpy(MEM + blk, host_tls_template, host_tls_template_size);
+        P32(teb + 0x1000, blk);
+    }
     P32(teb + 0x30, gpages(0x1000));           // PEB
     SETREG(c, 272, teb);                       // FS_OFFSET
     SETREG(c, R_ESP, stack + stack_size - 64);
@@ -215,6 +221,16 @@ SHIM(DecodePointer_) { RET(c, ARG(c, 0), 1); }
 SHIM(Sleep_) {
     uint32_t ms = ARG(c, 0);
     if (ms == 0xFFFFFFFFu) { fprintf(stderr, "[host] Sleep(INFINITE) — guest waits forever\n"); exit(4); }
+    static int trace = -1;
+    if (trace < 0) trace = getenv("FNV_TRACE_SLEEP") != NULL;
+    if (trace) {                                             // histogram of (caller, ms) every 2000 calls
+        static uint64_t n; static uint32_t hist[64][3]; static int nh;
+        uint32_t ra = G32(REG(c, R_ESP));
+        int i; for (i = 0; i < nh && !(hist[i][0] == ra && hist[i][1] == ms); i++) {}
+        if (i == nh && nh < 64) { hist[nh][0] = ra; hist[nh][1] = ms; nh++; }
+        if (i < 64) hist[i][2]++;
+        if (++n % 2000 == 0) { for (int k = 0; k < nh; k++) fprintf(stderr, "[sleep] ra=%#x ms=%u n=%u\n", hist[k][0], hist[k][1], hist[k][2]); }
+    }
     usleep((useconds_t)ms * 1000);
     RET(c, 0, 1);
 }

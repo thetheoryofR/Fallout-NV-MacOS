@@ -10,5 +10,5 @@ for f in "$HERE"/*.c; do clang -O1 -g -I"$HERE/.." -I/opt/homebrew/include ${RT_
 for f in "$HERE"/*.m; do clang -O1 -g -fobjc-arc -I"$HERE/.." -I/opt/homebrew/include ${RT_DEFS:-} -c "$f" -o "$B/host/$(basename "$f" .m).o"; done
 hobjs=()
 while IFS= read -r -d '' o; do hobjs+=("$o"); done < <(find "$B/host" -name '*.o' ! -name '._*' -print0)
-clang -o "$OUT" "${objs[@]}" "${hobjs[@]}" /opt/homebrew/lib/libunicorn.a -framework Metal -framework QuartzCore -framework AppKit -framework ImageIO -framework UniformTypeIdentifiers -framework CoreGraphics -framework AVFoundation -Wl,-stack_size,0x10000000
+clang ${LINK_OPT:-} -o "$OUT" "${objs[@]}" "${hobjs[@]}" /opt/homebrew/lib/libunicorn.a -framework Metal -framework QuartzCore -framework AppKit -framework ImageIO -framework UniformTypeIdentifiers -framework CoreGraphics -framework AVFoundation -framework CoreVideo -framework CoreMedia -Wl,-stack_size,0x10000000
 echo "linked $OUT"

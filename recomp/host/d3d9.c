@@ -62,11 +62,17 @@ static uint32_t newobj(uint32_t vt, int kind, uint32_t dev, int nfields) {
 static void addref(uint32_t o) { if (o) P32(o + 4, G32(o + 4) + 1); }
 static void Unk_QueryInterface(CPU *c) { addref(COM_THIS(c)); P32(ARG(c, 2), COM_THIS(c)); RET(c, 0, 3); }
 static void Unk_AddRef(CPU *c) { addref(COM_THIS(c)); RET(c, G32(COM_THIS(c) + 4), 1); }
+// Released resources are freed (guest memory back to the heap) a few frames later, and only once
+// nothing in the device state still points at them: D3D9's Set* calls hold a reference that this
+// layer doesn't count, and draws already encoded may still read the guest object. Shaders and
+// declarations are never freed — the pipeline cache is keyed by their addresses.
+static void bury(uint32_t o);
 static void Unk_Release(CPU *c) {
     uint32_t o = COM_THIS(c), r = G32(o + 4);
-    if (r) r--;
+    if (!r) { RET(c, 0, 1); return; }          // over-release: ignore (never free twice)
+    r--;
     P32(o + 4, r);
-    if (!r) d3d_backend_release(o);
+    if (!r) { d3d_backend_release(o); bury(o); }
     RET(c, r, 1);
 }
 static void Res_GetDevice(CPU *c) { uint32_t d = OBJ_DEV(COM_THIS(c)); addref(d); P32(ARG(c, 1), d); RET(c, 0, 2); }
@@ -107,12 +113,83 @@ static void level_layout(uint32_t fmt, uint32_t w, uint32_t h, uint32_t *pitch, 
 
 // ---- surfaces ------------------------------------------------------------------------------------
 // fields: 0 width, 1 height, 2 format, 3 usage, 4 pool, 5 data, 6 pitch, 7 container, 8 msaa, 9 level/face
-enum { S_W, S_H, S_FMT, S_USAGE, S_POOL, S_DATA, S_PITCH, S_CONT, S_MS, S_LEVEL, S_DIRTY, S_HOST, S_NF };
+enum { S_W, S_H, S_FMT, S_USAGE, S_POOL, S_DATA, S_PITCH, S_CONT, S_MS, S_LEVEL, S_DIRTY, S_HOST, S_LOCKS, S_EVICT, S_NF };
+
+// ---- surface data eviction ------------------------------------------------------------------------
+// Real D3D keeps texture contents in VRAM, outside the 32-bit address space. Here a surface's bytes
+// live in guest memory only while something holds a pointer to them (LockRect..UnlockRect, d3dx
+// fills, UpdateSurface): the first pin allocates them (zeroed), the last unpin moves them to host
+// memory (S_EVICT = slot + 1, S_DATA = 0), and the backend uploads from wherever they are.
+#include <pthread.h>
+static pthread_mutex_t ev_lk = PTHREAD_MUTEX_INITIALIZER;
+static struct { void *p; uint32_t n; } *ev_tab; static uint32_t ev_cap, ev_free_head;   // free list through n
+static uint64_t ev_bytes, ev_count;
+static void level_layout(uint32_t fmt, uint32_t w, uint32_t h, uint32_t *pitch, uint32_t *size);
+static void surf_restore_locked(uint32_t s) {
+    uint32_t e = G32(OBJ_F(s, S_EVICT));
+    if (!e) {
+        if (!G32(OBJ_F(s, S_DATA))) {                // never written: allocate on first use
+            uint32_t pitch, sz; level_layout(G32(OBJ_F(s, S_FMT)), G32(OBJ_F(s, S_W)), G32(OBJ_F(s, S_H)), &pitch, &sz);
+            P32(OBJ_F(s, S_DATA), gmalloc(sz ? sz : 4));
+        }
+        return;
+    }
+    uint32_t n = ev_tab[e - 1].n, d = gmalloc(n ? n : 4);
+    memcpy(MEM + d, ev_tab[e - 1].p, n);
+    free(ev_tab[e - 1].p); ev_tab[e - 1].p = NULL; ev_tab[e - 1].n = ev_free_head; ev_free_head = e;
+    ev_bytes -= n; ev_count--;
+    P32(OBJ_F(s, S_DATA), d); P32(OBJ_F(s, S_EVICT), 0);
+}
+static uint32_t surf_pin(uint32_t s) {
+    pthread_mutex_lock(&ev_lk);
+    surf_restore_locked(s);
+    P32(OBJ_F(s, S_LOCKS), G32(OBJ_F(s, S_LOCKS)) + 1);
+    uint32_t d = G32(OBJ_F(s, S_DATA));
+    pthread_mutex_unlock(&ev_lk);
+    return d;
+}
+static void surf_evict_locked(uint32_t s);
+static void surf_unpin(uint32_t s) {
+    pthread_mutex_lock(&ev_lk);
+    uint32_t l = G32(OBJ_F(s, S_LOCKS)); if (l) P32(OBJ_F(s, S_LOCKS), l - 1);
+    if (l <= 1) surf_evict_locked(s);
+    pthread_mutex_unlock(&ev_lk);
+}
+static void surf_evict_locked(uint32_t s) {
+    uint32_t d = G32(OBJ_F(s, S_DATA)), n = d ? gsize(d) : 0;
+    if (d && n >= 4096 && !G32(OBJ_F(s, S_LOCKS)) && !G32(OBJ_F(s, S_EVICT))) {
+        uint32_t e = ev_free_head;
+        if (e) ev_free_head = ev_tab[e - 1].n;
+        else {
+            if (ev_cap % 4096 == 0) ev_tab = realloc(ev_tab, sizeof *ev_tab * (ev_cap + 4096));
+            e = ++ev_cap;
+        }
+        ev_tab[e - 1].p = malloc(n); ev_tab[e - 1].n = n;
+        memcpy(ev_tab[e - 1].p, MEM + d, n);
+        gfree(d); ev_bytes += n; ev_count++;
+        P32(OBJ_F(s, S_DATA), 0); P32(OBJ_F(s, S_EVICT), e);
+    }
+}
+// backend: the bytes of a surface wherever they live (NULL: never written); holds the residency lock
+// until d3d_surf_end, so a concurrent pin cannot free the host copy mid-upload
+const uint8_t *d3d_surf_begin(uint32_t s) {
+    pthread_mutex_lock(&ev_lk);
+    uint32_t e = G32(OBJ_F(s, S_EVICT)), d = G32(OBJ_F(s, S_DATA));
+    return e ? (const uint8_t *)ev_tab[e - 1].p : d ? MEM + d : NULL;
+}
+void d3d_surf_end(void) { pthread_mutex_unlock(&ev_lk); }
+static void surf_drop_evicted(uint32_t s) {          // free: discard a host copy
+    pthread_mutex_lock(&ev_lk);
+    uint32_t e = G32(OBJ_F(s, S_EVICT));
+    if (e) { ev_bytes -= ev_tab[e - 1].n; ev_count--; free(ev_tab[e - 1].p); ev_tab[e - 1].p = NULL; ev_tab[e - 1].n = ev_free_head; ev_free_head = e; P32(OBJ_F(s, S_EVICT), 0); }
+    pthread_mutex_unlock(&ev_lk);
+}
+static uint64_t d3d_surf_bytes, d3d_surf_live, d3d_buf_bytes, d3d_buf_live;   // accounting
 static uint32_t new_surface(uint32_t dev, uint32_t w, uint32_t h, uint32_t fmt, uint32_t usage, uint32_t pool, uint32_t ms,
                             uint32_t container, uint32_t data, uint32_t pitch) {
     uint32_t s = newobj(vt_surf, K_SURF, dev, S_NF);
     uint32_t sz = 0;
-    if (!data) { level_layout(fmt, w, h, &pitch, &sz); data = gmalloc(sz ? sz : 4); }
+    if (!data) { level_layout(fmt, w, h, &pitch, &sz); d3d_surf_bytes += sz; d3d_surf_live++; }   // bytes allocated on first pin
     P32(OBJ_F(s, S_W), w); P32(OBJ_F(s, S_H), h); P32(OBJ_F(s, S_FMT), fmt); P32(OBJ_F(s, S_USAGE), usage);
     P32(OBJ_F(s, S_POOL), pool); P32(OBJ_F(s, S_DATA), data); P32(OBJ_F(s, S_PITCH), pitch);
     P32(OBJ_F(s, S_CONT), container); P32(OBJ_F(s, S_MS), ms);
@@ -127,7 +204,7 @@ static void Surf_GetDesc(CPU *c) {
 }
 static void Surf_LockRect(CPU *c) {
     uint32_t s = COM_THIS(c), lr = ARG(c, 1), rect = ARG(c, 2);
-    uint32_t data = G32(OBJ_F(s, S_DATA)), pitch = G32(OBJ_F(s, S_PITCH)), fmt = G32(OBJ_F(s, S_FMT));
+    uint32_t data = surf_pin(s), pitch = G32(OBJ_F(s, S_PITCH)), fmt = G32(OBJ_F(s, S_FMT));
     if (rect) {
         uint32_t x = G32(rect), y = G32(rect + 4); int blk = d3d_fmt_block(fmt);
         data += blk ? (y / 4) * pitch + (x / 4) * (uint32_t)blk : y * pitch + x * (uint32_t)d3d_fmt_bpp(fmt);
@@ -135,7 +212,7 @@ static void Surf_LockRect(CPU *c) {
     P32(lr, pitch); P32(lr + 4, data);
     RET(c, 0, 4);
 }
-static void Surf_UnlockRect(CPU *c) { d3d_backend_dirty(COM_THIS(c)); RET(c, 0, 1); }
+static void Surf_UnlockRect(CPU *c) { surf_unpin(COM_THIS(c)); d3d_backend_dirty(COM_THIS(c)); RET(c, 0, 1); }
 static void Surf_GetContainer(CPU *c) {
     uint32_t cont = G32(OBJ_F(COM_THIS(c), S_CONT));
     if (!cont) { P32(ARG(c, 2), 0); RET(c, E_NOINTERFACE, 3); return; }
@@ -192,7 +269,7 @@ static void Tex_GetSurfaceLevel(CPU *c) {
     addref(s); P32(ARG(c, 2), s); RET(c, 0, 3);
 }
 static void lock_level(CPU *c, uint32_t s, uint32_t lr, uint32_t rect) {
-    uint32_t data = G32(OBJ_F(s, S_DATA)), pitch = G32(OBJ_F(s, S_PITCH)), fmt = G32(OBJ_F(s, S_FMT));
+    uint32_t data = surf_pin(s), pitch = G32(OBJ_F(s, S_PITCH)), fmt = G32(OBJ_F(s, S_FMT));
     if (rect) { uint32_t x = G32(rect), y = G32(rect + 4); int blk = d3d_fmt_block(fmt);
         data += blk ? (y / 4) * pitch + (x / 4) * (uint32_t)blk : y * pitch + x * (uint32_t)d3d_fmt_bpp(fmt); }
     P32(lr, pitch); P32(lr + 4, data);
@@ -203,7 +280,7 @@ static void Tex_LockRect(CPU *c) {
     if (!s) { RET(c, D3DERR_INVALIDCALL, 5); return; }
     lock_level(c, s, ARG(c, 2), ARG(c, 3)); RET(c, 0, 5);
 }
-static void Tex_UnlockRect(CPU *c) { uint32_t s = tex_surf(COM_THIS(c), 0, ARG(c, 1)); if (s) d3d_backend_dirty(s); RET(c, 0, 2); }
+static void Tex_UnlockRect(CPU *c) { uint32_t s = tex_surf(COM_THIS(c), 0, ARG(c, 1)); if (s) { surf_unpin(s); d3d_backend_dirty(s); } RET(c, 0, 2); }
 static void Cube_GetCubeMapSurface(CPU *c) {
     uint32_t s = tex_surf(COM_THIS(c), ARG(c, 1), ARG(c, 2));
     if (!s) { RET(c, D3DERR_INVALIDCALL, 4); return; }
@@ -214,7 +291,7 @@ static void Cube_LockRect(CPU *c) {
     if (!s) { RET(c, D3DERR_INVALIDCALL, 6); return; }
     lock_level(c, s, ARG(c, 3), ARG(c, 4)); RET(c, 0, 6);
 }
-static void Cube_UnlockRect(CPU *c) { uint32_t s = tex_surf(COM_THIS(c), ARG(c, 1), ARG(c, 2)); if (s) d3d_backend_dirty(s); RET(c, 0, 3); }
+static void Cube_UnlockRect(CPU *c) { uint32_t s = tex_surf(COM_THIS(c), ARG(c, 1), ARG(c, 2)); if (s) { surf_unpin(s); d3d_backend_dirty(s); } RET(c, 0, 3); }
 static void Tex_GetAutoGen(CPU *c) { RET(c, 2 /* D3DTEXF_LINEAR */, 1); }
 static const Ov tex_ov[] = {
     {"QueryInterface", Unk_QueryInterface}, {"AddRef", Unk_AddRef}, {"Release", Unk_Release}, {"GetDevice", Res_GetDevice},
@@ -230,11 +307,11 @@ static const Ov cube_ov[] = {
 };
 
 // ---- vertex / index buffers ------------------------------------------------------------------------
-enum { B_LEN, B_USAGE, B_FMT, B_POOL, B_DATA, B_NF };
+enum { B_LEN, B_USAGE, B_FMT, B_POOL, B_DATA, B_HOST, B_DIRTY, B_UPS, B_NF };   // HOST/DIRTY/UPS: backend-owned
 static uint32_t new_buffer(uint32_t dev, int kind, uint32_t len, uint32_t usage, uint32_t fmt, uint32_t pool) {
     uint32_t b = newobj(kind == K_VB ? vt_vb : vt_ib, kind, dev, B_NF);
     P32(OBJ_F(b, B_LEN), len); P32(OBJ_F(b, B_USAGE), usage); P32(OBJ_F(b, B_FMT), fmt); P32(OBJ_F(b, B_POOL), pool);
-    P32(OBJ_F(b, B_DATA), gmalloc(len ? len : 4));
+    P32(OBJ_F(b, B_DATA), gmalloc(len ? len : 4)); d3d_buf_bytes += len; d3d_buf_live++;
     d3d_backend_created(b);
     return b;
 }
@@ -289,9 +366,69 @@ static const Ov sb_ov[] = {{"QueryInterface", Unk_QueryInterface}, {"AddRef", Un
 // ---- the device ------------------------------------------------------------------------------------
 D3DState g_d3d;          // the one device's state (FNV creates a single device)
 
+#include <pthread.h>
+#define GRAVE_N 65536
+static pthread_mutex_t grave_lk = PTHREAD_MUTEX_INITIALIZER;
+static struct { uint32_t o; uint64_t frame; } grave[GRAVE_N];
+static int ngrave;
+static uint64_t grave_freed;
+static void bury_locked(uint32_t o) {
+    int k = (int)OBJ_KIND(o);
+    if (k != K_TEX && k != K_CUBE && k != K_SURF && k != K_VB && k != K_IB) return;
+    if (k == K_SURF && G32(OBJ_F(o, S_CONT))) return;           // owned by a live texture
+    if (ngrave < GRAVE_N) { grave[ngrave].o = o; grave[ngrave].frame = g_d3d.frames; ngrave++; }
+}
+static void bury(uint32_t o) { pthread_mutex_lock(&grave_lk); bury_locked(o); pthread_mutex_unlock(&grave_lk); }
+static int is_bound(uint32_t o) {
+    for (int i = 0; i < 32; i++) if (g_d3d.tex[i] == o) return 1;
+    for (int i = 0; i < 16; i++) if (g_d3d.stream[i] == o) return 1;
+    for (int i = 0; i < 4; i++) if (g_d3d.rt[i] == o) return 1;
+    return g_d3d.indices == o || g_d3d.ds == o || g_d3d.backbuffer == o;
+}
+static void free_obj(uint32_t o) {
+    int k = (int)OBJ_KIND(o);
+    if (k == K_TEX || k == K_CUBE) {
+        uint32_t arr = G32(OBJ_F(o, T_SURFS)), n = G32(OBJ_F(o, T_LEVELS)) * G32(OBJ_F(o, T_FACES));
+        for (uint32_t i = 0; arr && i < n; i++) {
+            uint32_t s = G32(arr + 4 * i);
+            if (!s) continue;
+            P32(OBJ_F(s, S_CONT), 0);                            // the texture's reference on its levels
+            uint32_t r = G32(s + 4); if (r) r--; P32(s + 4, r);
+            if (!r) { d3d_backend_release(s); bury_locked(s); }    // a level the game still holds stays alive
+        }
+        if (arr) gfree(arr);
+    } else if (k == K_SURF) {
+        d3d_surf_live--;
+        surf_drop_evicted(o);
+        if (G32(OBJ_F(o, S_DATA))) { d3d_surf_bytes -= gsize(G32(OBJ_F(o, S_DATA))); gfree(G32(OBJ_F(o, S_DATA))); }
+    } else if (k == K_VB || k == K_IB) {
+        if (G32(OBJ_F(o, B_DATA))) { d3d_buf_bytes -= G32(OBJ_F(o, B_LEN)); d3d_buf_live--; gfree(G32(OBJ_F(o, B_DATA))); }
+    }
+    P32(o + 8, 0);                                                 // kind 0: a stale pointer can't pass for a resource
+    gfree(o);
+    grave_freed++;
+}
+static void reap(void) {                                           // called once per Present
+    pthread_mutex_lock(&grave_lk);
+    // compacting in place; free_obj may append texture levels, which this loop then keeps (too young)
+    int w = 0;
+    for (int i = 0; i < ngrave; i++) {
+        uint32_t o = grave[i].o;
+        if (G32(o + 4) != 0) continue;                               // resurrected by an AddRef: not ours
+        if (grave[i].frame + 3 <= g_d3d.frames && !is_bound(o)) free_obj(o);
+        else grave[w++] = grave[i];
+    }
+    ngrave = w;
+    if (g_d3d.frames % 3000 == 0)
+        fprintf(stderr, "[d3d] surfaces %llu live (%llu evicted to host: %llu MB), buffers %llu live / %llu MB, freed %llu objects, %d waiting\n",
+                (unsigned long long)d3d_surf_live, (unsigned long long)ev_count, (unsigned long long)(ev_bytes >> 20),
+                (unsigned long long)d3d_buf_live, (unsigned long long)(d3d_buf_bytes >> 20), (unsigned long long)grave_freed, ngrave);
+    pthread_mutex_unlock(&grave_lk);
+}
+
 static void Swap_GetBackBuffer(CPU *c) { uint32_t s = g_d3d.backbuffer; addref(s); P32(ARG(c, 3), s); RET(c, 0, 4); }
 static void Swap_GetPresentParameters(CPU *c) { memcpy(MEM + ARG(c, 1), g_d3d.pp, 56); RET(c, 0, 2); }
-static void Swap_Present(CPU *c) { d3d_backend_present(&g_d3d); RET(c, 0, 6); }
+static void Swap_Present(CPU *c) { d3d_backend_present(&g_d3d); reap(); RET(c, 0, 6); }
 static void Swap_GetDisplayMode(CPU *c) { uint32_t m = ARG(c, 1); P32(m, g_d3d.width); P32(m + 4, g_d3d.height); P32(m + 8, 60); P32(m + 12, 22); RET(c, 0, 2); }
 static const Ov swap_ov[] = {{"QueryInterface", Unk_QueryInterface}, {"AddRef", Unk_AddRef}, {"Release", Unk_Release},
                              {"Present", Swap_Present}, {"GetBackBuffer", Swap_GetBackBuffer}, {"GetDisplayMode", Swap_GetDisplayMode},
@@ -313,7 +450,7 @@ static void Dev_Reset(CPU *c) {
     d3d_backend_resize(&g_d3d);
     RET(c, 0, 2);
 }
-static void Dev_Present(CPU *c) { d3d_backend_present(&g_d3d); RET(c, 0, 5); }
+static void Dev_Present(CPU *c) { d3d_backend_present(&g_d3d); reap(); RET(c, 0, 5); }
 static void Dev_GetBackBuffer(CPU *c) { uint32_t s = g_d3d.backbuffer; addref(s); P32(ARG(c, 4), s); RET(c, 0, 5); }
 static void Dev_GetRasterStatus(CPU *c) { memset(MEM + ARG(c, 2), 0, 8); RET(c, 0, 3); }
 static void Dev_CreateTexture(CPU *c) {
@@ -446,7 +583,11 @@ static void Dev_StretchRect(CPU *c) { d3d_backend_stretch(&g_d3d, ARG(c, 1), ARG
 static void Dev_UpdateSurface(CPU *c) {
     uint32_t src = ARG(c, 1), dst = ARG(c, 3);
     uint32_t n = G32(OBJ_F(src, S_PITCH)) * G32(OBJ_F(src, S_H)), m = G32(OBJ_F(dst, S_PITCH)) * G32(OBJ_F(dst, S_H));
-    if (!ARG(c, 2) && !ARG(c, 4) && n == m) { memcpy(MEM + G32(OBJ_F(dst, S_DATA)), MEM + G32(OBJ_F(src, S_DATA)), n); d3d_backend_dirty(dst); }
+    if (!ARG(c, 2) && !ARG(c, 4) && n == m) {
+        uint32_t a = surf_pin(src), b = surf_pin(dst);
+        memcpy(MEM + b, MEM + a, n);
+        surf_unpin(src); surf_unpin(dst); d3d_backend_dirty(dst);
+    }
     RET(c, 0, 5);
 }
 static void Dev_UpdateTexture(CPU *c) {
@@ -456,7 +597,11 @@ static void Dev_UpdateTexture(CPU *c) {
         for (uint32_t l = 0; l < lv; l++) {
             uint32_t a = tex_surf(src, f, l), b = tex_surf(dst, f, l);
             uint32_t n = G32(OBJ_F(a, S_PITCH)) * G32(OBJ_F(a, S_H)), m = G32(OBJ_F(b, S_PITCH)) * G32(OBJ_F(b, S_H));
-            if (n == m) { memcpy(MEM + G32(OBJ_F(b, S_DATA)), MEM + G32(OBJ_F(a, S_DATA)), n); d3d_backend_dirty(b); }
+            if (n == m) {
+                uint32_t pa = surf_pin(a), pb = surf_pin(b);
+                memcpy(MEM + pb, MEM + pa, n);
+                surf_unpin(a); surf_unpin(b); d3d_backend_dirty(b);
+            }
         }
     RET(c, 0, 3);
 }
@@ -633,9 +778,9 @@ uint32_t d3d9_texture_level_data(uint32_t tex, uint32_t face, uint32_t level, ui
     *pitch = G32(OBJ_F(s, S_PITCH));
     uint32_t p, sz; level_layout(G32(OBJ_F(s, S_FMT)), G32(OBJ_F(s, S_W)), G32(OBJ_F(s, S_H)), &p, &sz);
     *size = sz;
-    return G32(OBJ_F(s, S_DATA));
+    return surf_pin(s);                               // unpinned by d3d9_texture_dirty
 }
 void d3d9_texture_dirty(uint32_t tex) {
     for (uint32_t f = 0; f < G32(OBJ_F(tex, T_FACES)); f++)
-        for (uint32_t l = 0; l < G32(OBJ_F(tex, T_LEVELS)); l++) d3d_backend_dirty(tex_surf(tex, f, l));
+        for (uint32_t l = 0; l < G32(OBJ_F(tex, T_LEVELS)); l++) { surf_unpin(tex_surf(tex, f, l)); d3d_backend_dirty(tex_surf(tex, f, l)); }
 }
