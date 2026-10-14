@@ -1,4 +1,4 @@
-# byog-recomp — bring-your-own-game static recompiler for 32-bit x86
+# Fallout-NV-MacOS — bring-your-own-game static recompiler for 32-bit x86 (Fallout: New Vegas on Apple Silicon)
 
 Translates the machine code of a 32-bit Windows (x86) game into C that compiles natively for
 Apple Silicon (arm64), runs it on a native host (Win32/COM shims, Direct3D 9 → Metal, input), and **proves each translated function correct** by running the original
