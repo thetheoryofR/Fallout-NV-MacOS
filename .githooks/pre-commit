@@ -1,0 +1,15 @@
+#!/bin/bash
+# Refuses commits that could contain game-derived material.
+bad=0
+while IFS= read -r -d '' f; do
+  [ -f "$f" ] || continue
+  case "$f" in
+    *.exe|*.dll|*.pdb|*.gpr|*.jsonl|*.regs.json|*.dylib|*.o) echo "blocked (type): $f"; bad=1; continue;;
+    gen*/*|build*/*|*/gen*/*|*/build*/*) echo "blocked (generated dir): $f"; bad=1; continue;;
+  esac
+  if [ "$(head -c 2 "$f")" = "MZ" ]; then echo "blocked (PE binary): $f"; bad=1; continue; fi
+  if [ "$(wc -c < "$f")" -gt 1048576 ]; then echo "blocked (>1 MB): $f"; bad=1; continue; fi
+  # emitted C carries these markers
+  if grep -qE '^void g_[0-9a-f]+\(CPU \*c\)|rt_fn_addr\[\] = \{0x' "$f"; then echo "blocked (generated C): $f"; bad=1; fi
+done < <(git diff --cached --name-only -z --diff-filter=ACM)
+[ $bad -eq 0 ] || { echo "pre-commit: game-derived material refused (see README 'Bring your own game')"; exit 1; }

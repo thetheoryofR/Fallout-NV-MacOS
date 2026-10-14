@@ -1,0 +1,16 @@
+# Game-derived material never lives here — keep your work dir outside the repo.
+*.exe
+*.dll
+*.pdb
+*.gpr
+*.rep/
+*.jsonl
+*.regs.json
+gen*/
+build*/
+*.dylib
+*.o
+env/
+__pycache__/
+.DS_Store
+._*
